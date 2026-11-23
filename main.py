@@ -14,8 +14,14 @@ Strategy (fresh implementation of the Opus 5.5 design spec):
 - CORE -> FLAT on a 250 bps hard stop below the core entry close, or on
   close < 240-bar low AND spread <= -15 bps.
 - Kill-switch on equity drawdown from peak: >= 6% -> flat + 240-bar re-entry
-  lock; >= 9% -> flat permanently. Max 12 orders per 24h (exits exempt).
-- One order per state change, market, max_slippage_bps 30 (50 on retry).
+  lock; >= 9% -> flat permanently. NOTE (2b, honest): the 6% lock is
+  effectively PERMANENT in practice — peak_equity is never reset, so once
+  flat the drawdown stays >= 6% and lock_until_seq is extended on every
+  batch, so re-entry never happens. Accepted as conservative/safe for a
+  24h race; do not rely on the 240-bar re-entry ever firing.
+- Max 12 orders per 24h (exits exempt).
+- One order per state change, market, max_slippage_bps 30 (50 on core retry,
+  100 on all sells).
 - Deterministic: float64 indicators only, no clock, no randomness, no I/O,
   no network, no environment reads. Stdlib only + vendored SDK shim.
 """
@@ -50,6 +56,7 @@ LOCK_BARS = 240
 MAX_ORDERS = 12
 MAX_SLIPPAGE_BPS = 30
 RETRY_SLIPPAGE_BPS = 50
+EXIT_SLIPPAGE_BPS = 100  # (2c) all SELL orders: hard stop / low240 / kill-switch / trailing / downgrade
 MIN_BARS_OVERLAY = 120
 RETRY_AFTER_BARS = 30
 
@@ -151,7 +158,7 @@ def _sell_qty(state, qty):
         if value < min_notional:
             return None
     return {"side": "sell", "symbol": SYMBOL, "qty": qty,
-            "max_slippage_bps": MAX_SLIPPAGE_BPS}
+            "max_slippage_bps": EXIT_SLIPPAGE_BPS}
 
 
 def _sell_all(state):
@@ -161,7 +168,7 @@ def _sell_all(state):
     return _sell_qty(state, held.qty)
 
 
-def on_batch(state, batch):
+def _on_batch_impl(state, batch):
     global mode, core_entry_close, peak_since_upgrade, upgrade_seq
     global last_order_seq, orders_sent, peak_equity, lock_until_seq
     global perm_flat, core_attempted, core_filled_once
@@ -203,16 +210,36 @@ def on_batch(state, batch):
         if held is not None:
             order = _sell_all(state)
             if order is not None:
-                mode = "FLAT"
-                core_entry_close = None
-                peak_since_upgrade = None
+                # (2a) Do NOT touch mode/entry/peak on decision: the fill
+                # may be rejected (max_slippage) while the position is
+                # still held. The held-is-None branch clears them once a
+                # fill has actually landed; the holding-block sync below
+                # re-derives mode from filled weight if it was rejected.
                 last_order_seq = seq
                 orders_sent += 1
                 return [order]
-        mode = "FLAT"
-        core_entry_close = None
-        peak_since_upgrade = None
+        if held is None:
+            mode = "FLAT"
+            core_entry_close = None
+            peak_since_upgrade = None
         return []
+
+    # --- (2a) resync mode from the actually-filled weight ---
+    # A sell/buy decided on an earlier batch may have been rejected
+    # (max_slippage) while the position is still held; never trust the
+    # mode/entry/peak set at decision time. Derive them from the fill:
+    # held value > ~65% of equity means FULL (peak kept, or seeded with
+    # this close if missing, so the trailing stop stays alive); at or
+    # below that it is CORE (no trailing stop applies).
+    if held is not None:
+        held_value = state.value(SYMBOL, held.qty)
+        if state.equity > 0 and held_value * 100 > 65 * state.equity:
+            mode = "FULL"
+            if peak_since_upgrade is None:
+                peak_since_upgrade = close
+        else:
+            mode = "CORE"
+            peak_since_upgrade = None
 
     if held is not None and peak_since_upgrade is not None and mode == "FULL":
         if close > peak_since_upgrade:
@@ -271,9 +298,9 @@ def on_batch(state, batch):
         if close < core_entry_close * (1.0 - HARD_STOP_BPS / 10000.0):
             order = _sell_all(state)
             if order is not None:
-                mode = "FLAT"
-                core_entry_close = None
-                peak_since_upgrade = None
+                # (2a) Send the sell, return, change nothing: if the fill
+                # is rejected the position is still held and the hard stop
+                # must stay alive for the next batch.
                 last_order_seq = seq
                 orders_sent += 1
                 return [order]
@@ -281,9 +308,7 @@ def on_batch(state, batch):
             and close < low240 and spread <= DOWN_EXIT_SPREAD_BPS):
         order = _sell_all(state)
         if order is not None:
-            mode = "FLAT"
-            core_entry_close = None
-            peak_since_upgrade = None
+            # (2a) Same: decide only, do not clear mode/entry/peak.
             last_order_seq = seq
             orders_sent += 1
             return [order]
@@ -348,11 +373,25 @@ def _downgrade_to_core(state, seq):
     order = _sell_qty(state, qty)
     if order is None:
         return []
-    mode = "CORE"
-    peak_since_upgrade = None
+    # (2a) Send the downgrade sell, return, change nothing: if the fill is
+    # rejected the overlay is still held, so mode must stay FULL and the
+    # trailing stop (peak_since_upgrade) must stay alive. The next batch's
+    # holding-block sync re-derives mode from the filled weight.
     last_order_seq = seq
     orders_sent += 1
     return [order]
+
+
+def on_batch(state, batch):
+    """Defensive wrapper (§4): an unexpected exception must never crash
+    the run — the shim lets a raised exception kill the bot process.
+    Return no orders and log one line to stderr (stdout is replies only).
+    """
+    try:
+        return _on_batch_impl(state, batch)
+    except Exception as exc:  # noqa: BLE001 - protocol defence, never crash
+        sys.stderr.write("on_batch error: %r\n" % (exc,))
+        return []
 
 
 makefun_bars.run(on_batch)
